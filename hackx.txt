@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Privacy Vault - Data Exposure Audit</title>
+    <!-- Load Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary': '#4f46e5',
+                        'secondary': '#8b5cf6',
+                        'accent': '#10b981',
+                        'background': '#f9fafb',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'sans-serif'],
+                    },
+                }
+            }
+        }
+    </script>
+    <style>
+        /* --- General and Login/Register (Light Theme) Styles --- */
+        body {
+            font-family: 'Inter', sans-serif;
+            transition: background-color 0.3s, color 0.3s;
+        }
+        .bg-background { background-color: #f3f4f6; }
+        .card {
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+        }
+        .form-input {
+            padding: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            width: 100%;
+            transition: all 0.2s;
+        }
+        .form-input:focus {
+            outline: none;
+            border-color: #4f46e5;
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.3);
+        }
+
+        /* --- Audit/Dashboard (Dark Theme) Styles --- */
+        .dark-body {
+            background-color: #1a1a2e; /* Dark background */
+            color: #e4e4e7; /* Light text */
+        }
+        .dark-card {
+            background-color: #272741;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.5);
+            transition: transform 0.3s ease;
+        }
+        .dark-card:hover {
+            transform: translateY(-2px);
+        }
+        .risk-low { color: #10b981; } /* Emerald green */
+        .risk-medium { color: #facc15; } /* Yellow */
+        .risk-high { color: #ef4444; } /* Red */
+
+        /* Custom range styling */
+        input[type="range"] {
+            -webkit-appearance: none;
+            width: 100%;
+            height: 8px;
+            background: #3f3f46;
+            border-radius: 5px;
+            outline: none;
+            margin: 10px 0;
+        }
+        input[type="range"]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 20px;
+            height: 20px;
+            border-radius: 50%;
+            background: #6366f1; /* Indigo */
+            cursor: pointer;
+            transition: background 0.15s ease-in-out;
+        }
+        input[type="range"]::-webkit-slider-thumb:hover {
+            background: #4f46e5;
+        }
+    </style>
+    <!-- Firebase SDK Imports (required for persistence) -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, deleteDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        setLogLevel('Debug'); // Enable detailed Firestore logging
+
+        // Global variables for Firebase instances and user state
+        let app = null;
+        window.db = null;
+        window.auth = null;
+        window.userId = null;
+        window.userProfile = null;
+        window.appId = null;
+        window.isAuthReady = false;
+
+        // --- Core Audit Constants and Functions (from user's request) ---
+        const RISK_TIERS = [
+            { maxScore: 5, level: "Minimal", colorClass: "risk-low", description: "You have strong data habits and minimal exposure to identity theft risk." },
+            { maxScore: 10, level: "Moderate", colorClass: "risk-medium", description: "Your data habits are good, but there are a few areas for improvement to reduce your risk." },
+            { maxScore: 15, level: "High", colorClass: "risk-high", description: "You are sharing excessive data, making you a target. Immediate action is recommended to reduce your exposure." },
+            { maxScore: 20, level: "Critical", colorClass: "risk-high", description: "Your current habits pose a critical risk to your identity and privacy. Major changes are required now." },
+        ];
+
+        const RECOMMENDATIONS = {
+            'social-login': [
+                { threshold: 3, text: "🛑 **STOP** using social logins for *all* apps. Use 'Sign Up with Email' instead to isolate your accounts." },
+            ],
+            'location-share': [
+                { threshold: 2, text: "🗺️ **AUDIT** your apps. Revoke 'Always-On Location' permission for all non-navigation/non-weather apps." },
+            ],
+            'email-reuse': [
+                { threshold: 1, text: "🔐 **INVEST** in a password manager. Use unique, strong passwords and stop reusing accounts." },
+            ],
+            'public-info': [
+                { threshold: 1, text: "👤 **PRIVACY CHECK**: Set social media profiles to *Private*. Never post your full birth date or exact location." },
+            ]
+        };
+
+        const scoreWeights = {
+            'social-login': 3,
+            'location-share': 4,
+            'email-reuse': 5,
+            'public-info': 4
+        };
+
+        window.calculateScore = () => {
+            let totalScore = 0;
+            const inputs = document.querySelectorAll('#audit-section input[type="range"]');
+            const habits = {};
+
+            inputs.forEach(input => {
+                const id = input.id;
+                const value = parseInt(input.value);
+                habits[id] = value;
+                totalScore += value * (scoreWeights[id] || 1); 
+            });
+
+            return { totalScore, habits };
+        }
+
+        window.runAudit = () => {
+            const { totalScore, habits } = window.calculateScore();
+            
+            // 1. Determine Risk Tier
+            let riskTier = RISK_TIERS.find(tier => totalScore <= tier.maxScore) || RISK_TIERS[RISK_TIERS.length - 1];
+
+            // 2. Display Results
+            const scoreElement = document.getElementById('exposure-score');
+            const levelElement = document.getElementById('risk-level');
+            const resultsSection = document.getElementById('results-section');
+            const auditSection = document.getElementById('audit-section');
+
+            if (!scoreElement || !levelElement || !resultsSection || !auditSection) {
+                 window.displayMessage("Error: Could not find audit elements. Try logging out and back in.", true);
+                 return;
+            }
+
+            // Clear previous classes and set new ones
+            scoreElement.className = 'text-6xl font-extrabold mt-2';
+            scoreElement.classList.add(riskTier.colorClass);
+            scoreElement.textContent = totalScore;
+            
+            levelElement.className = 'text-xl font-semibold mt-1';
+            levelElement.classList.add(riskTier.colorClass);
+            levelElement.textContent = `${riskTier.level} Risk`;
+            
+            // 3. Generate Recommendations
+            const recList = document.getElementById('recommendations-list');
+            recList.innerHTML = ''; // Clear old recommendations
+
+            // Update detailed description
+            const descriptionElement = document.createElement('li');
+            descriptionElement.className = 'text-sm text-center italic text-gray-400 mb-4 list-none';
+            descriptionElement.innerHTML = `<span>${riskTier.description}</span>`;
+            recList.appendChild(descriptionElement);
+            
+            let hasSpecificRec = false;
+
+            for (const id in habits) {
+                const habitValue = habits[id];
+                const recs = RECOMMENDATIONS[id];
+
+                if (recs) {
+                    recs.forEach(rec => {
+                        if (habitValue >= rec.threshold) {
+                            const listItem = document.createElement('li');
+                            listItem.className = 'flex items-start';
+                            // Replace **text** with <strong>text</strong>
+                            const formattedText = rec.text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
+                            listItem.innerHTML = `<span class="mr-2 text-indigo-400 text-lg">•</span> <span>${formattedText}</span>`;
+                            recList.appendChild(listItem);
+                            hasSpecificRec = true;
+                        }
+                    });
+                }
+            }
+            
+            if (!hasSpecificRec) {
+                const listItem = document.createElement('li');
+                listItem.className = 'flex items-start text-gray-400';
+                listItem.innerHTML = `<span class="mr-2 text-indigo-400 text-lg">•</span> <span>Great job! Continue to be diligent and review app permissions regularly.</span>`;
+                recList.appendChild(listItem);
+            }
+            
+            // 4. Show Results and Hide Audit
+            auditSection.classList.add('hidden');
+            resultsSection.classList.remove('hidden');
+
+            // Scroll to the top of the results for mobile users
+            resultsSection.scrollIntoView({ behavior: 'smooth' });
+        }
+
+        window.resetAudit = () => {
+            const resultsSection = document.getElementById('results-section');
+            const auditSection = document.getElementById('audit-section');
+            
+            if (!resultsSection || !auditSection) return;
+
+            // Hide Results and Show Audit
+            resultsSection.classList.add('hidden');
+            auditSection.classList.remove('hidden');
+
+            // Scroll to the top of the audit for mobile users
+            auditSection.scrollIntoView({ behavior: 'smooth' });
+        }
+        // --- End Audit Logic ---
+
+
+        // Global function for handling alerts/messages without window.alert()
+        window.displayMessage = (text, isError = false) => {
+            const messageBox = document.getElementById('message-box');
+            if (!messageBox) return;
+
+            messageBox.textContent = text;
+            messageBox.className = `p-3 mb-4 rounded-lg text-sm transition duration-300 ${isError ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`;
+            messageBox.style.display = 'block';
+
+            clearTimeout(messageBox.timeoutId);
+            messageBox.timeoutId = setTimeout(() => {
+                messageBox.style.display = 'none';
+            }, 5000);
+        };
+
+        // Utility to securely encode/decode data (simulating encryption/hashing)
+        window.hash = (text) => btoa(text);
+        window.verifyHash = (text, hashed) => btoa(text) === hashed;
+
+        // Simple confirmation simulation to replace forbidden window.confirm
+        window.confirm = (message) => {
+            // Use prompt for confirmation of destructive actions
+            const confirmation = prompt(message + " (Type YES to confirm)");
+            return confirmation && confirmation.toUpperCase() === 'YES';
+        }
+
+        // --- Firebase Initialization and Authentication ---
+        const initializeFirebase = async () => {
+            try {
+                // Mandatory global variables check
+                const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : null;
+                const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+                window.appId = typeof __app_id !== 'undefined' ? __app_id : 'default-privacy-vault';
+
+                if (!firebaseConfig) {
+                    displayMessage("Error: Firebase configuration is missing.", true);
+                    return;
+                }
+
+                app = initializeApp(firebaseConfig);
+                window.db = getFirestore(app);
+                window.auth = getAuth(app);
+
+                onAuthStateChanged(window.auth, async (user) => {
+                    if (user) {
+                        window.userId = user.uid;
+                        await loadUserProfile(user.uid);
+                    } else {
+                        // If no user, sign in anonymously if custom token is not available
+                        if (!initialAuthToken) {
+                            await signInAnonymously(window.auth);
+                        }
+                    }
+                    window.isAuthReady = true;
+                    // Initial render after auth state is determined
+                    renderApp();
+                });
+
+                if (initialAuthToken) {
+                    await signInWithCustomToken(window.auth, initialAuthToken);
+                } else if (!window.auth.currentUser) {
+                     await signInAnonymously(window.auth);
+                }
+
+            } catch (error) {
+                console.error("Firebase Initialization Error:", error);
+                displayMessage("Failed to initialize the app. See console for details.", true);
+            }
+        };
+
+        // --- Firestore Data Operations ---
+
+        // Private path for user data: /artifacts/{appId}/users/{userId}/identity_vault/user_profile
+        window.getUserDocRef = (uid) => {
+            return doc(window.db, `artifacts/${window.appId}/users/${uid}/identity_vault`, 'user_profile');
+        };
+
+        window.loadUserProfile = async (uid) => {
+            try {
+                if (!window.db || !uid) return;
+                const docRef = window.getUserDocRef(uid);
+                const docSnap = await getDoc(docRef);
+
+                if (docSnap.exists()) {
+                    window.userProfile = docSnap.data();
+                    console.log("Profile loaded:", window.userProfile);
+                } else {
+                    window.userProfile = { is_registered: false };
+                    console.log("No existing profile found. User needs to register.");
+                }
+            } catch (error) {
+                console.error("Error loading user profile:", error);
+                displayMessage("Failed to load profile data.", true);
+            }
+        };
+
+        // --- Core Application Logic ---
+
+        window.handleRegistration = async () => {
+            const email = document.getElementById('reg-email').value.trim();
+            const password = document.getElementById('reg-password').value;
+            const fullName = document.getElementById('reg-fullname').value.trim();
+            const dob = document.getElementById('reg-dob').value;
+            const errorElement = document.getElementById('reg-error');
+            errorElement.textContent = '';
+
+            if (!email || !password || !fullName || !dob) {
+                errorElement.textContent = 'All fields are required.';
+                return;
+            }
+            if (password.length < 6) {
+                errorElement.textContent = 'Password must be at least 6 characters.';
+                return;
+            }
+
+            try {
+                const hashedPassword = window.hash(password);
+                const dobTimestamp = new Date(dob).toISOString(); // Store DOB securely as ISO string
+
+                const profileData = {
+                    email: window.hash(email),
+                    hashed_password: hashedPassword,
+                    full_name: btoa(fullName),
+                    date_of_birth: btoa(dobTimestamp),
+                    is_registered: true,
+                    created_at: new Date().toISOString(),
+                    vault_user_id: window.userId
+                };
+
+                await setDoc(window.getUserDocRef(window.userId), profileData);
+                window.userProfile = profileData;
+                displayMessage('Registration successful! Your vault is created.', false);
+                renderApp();
+
+            } catch (error) {
+                console.error("Registration Error:", error);
+                displayMessage("Registration failed. Please try again.", true);
+            }
+        };
+
+        window.handleLogin = async () => {
+            const email = document.getElementById('login-email').value.trim();
+            const password = document.getElementById('login-password').value;
+            const token = document.getElementById('login-token').value;
+            const errorElement = document.getElementById('login-error');
+            errorElement.textContent = '';
+
+            if (!email || !password || !token) {
+                errorElement.textContent = 'Email, Password, and Token (OTP) are required.';
+                return;
+            }
+
+            // 1. Check token simulation (must be '123456')
+            if (token !== '123456') {
+                errorElement.textContent = 'Authentication failed: Invalid simulated token.';
+                return;
+            }
+
+            // 2. Load profile data and verify credentials
+            await window.loadUserProfile(window.userId); // Ensure we have the latest profile
+
+            if (window.userProfile && window.userProfile.is_registered) {
+                const hashedEmailMatch = window.userProfile.email === window.hash(email);
+                const passwordMatch = window.verifyHash(password, window.userProfile.hashed_password);
+
+                if (hashedEmailMatch && passwordMatch) {
+                    displayMessage('Login successful! Welcome back.', false);
+                    renderApp();
+                    return;
+                }
+            }
+
+            errorElement.textContent = 'Authentication failed: Invalid credentials or user not registered.';
+        };
+
+        /**
+         * Clears the in-memory user details and returns to the login/register screen.
+         * The stored data in Firestore remains intact for multiple logins.
+         */
+        window.handleLogout = async () => {
+            // Clear in-memory profile data
+            window.userProfile = { is_registered: false };
+            
+            // Rerender the app to show the login/register screen
+            window.displayMessage('Logout successful. Credentials remain stored, log back in to access the Vault.', false);
+            window.renderApp();
+        };
+
+        /**
+         * Permanently deletes the user's stored vault profile from Firestore.
+         * This fulfills the "clear all details" requirement.
+         */
+        window.handleDeleteProfile = async () => {
+            if (!window.db || !window.userId) {
+                window.displayMessage("Cannot delete: App not fully initialized.", true);
+                return;
+            }
+
+            if (window.confirm("Are you sure you want to PERMANENTLY delete your entire Vault data? This cannot be undone.")) {
+                try {
+                    const docRef = window.getUserDocRef(window.userId);
+                    await deleteDoc(docRef);
+
+                    // Reset in-memory state
+                    window.userProfile = { is_registered: false };
+                    
+                    window.displayMessage("Vault data successfully deleted. You must register a new profile to proceed.", false);
+                    window.renderApp();
+
+                } catch (error) {
+                    console.error("Error deleting profile:", error);
+                    window.displayMessage("Failed to delete Vault data. See console.", true);
+                }
+            }
+        };
+
+
+        // --- UI Rendering Functions ---
+
+        window.renderApp = () => {
+            const container = document.getElementById('app-container');
+            if (!container || !window.isAuthReady) {
+                // Show loading state if auth isn't ready
+                document.body.className = 'flex items-start justify-center min-h-screen p-4 md:p-8 bg-background';
+                container.innerHTML = `
+                    <div class="flex flex-col items-center justify-center h-48 max-w-md w-full">
+                        <svg class="animate-spin -ml-1 mr-3 h-8 w-8 text-primary" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                        </svg>
+                        <p class="mt-4 text-gray-600">Initializing Secure Vault...</p>
+                    </div>
+                `;
+                return;
+            }
+
+            if (window.userProfile && window.userProfile.is_registered) {
+                // LOGGED IN: Render Audit/Dashboard (Dark Theme)
+                document.body.className = 'dark-body flex items-start justify-center min-h-screen p-4 md:p-8';
+                container.innerHTML = renderDashboard();
+            } else if (window.userProfile && !window.userProfile.is_registered) {
+                // LOGGED OUT/NOT REGISTERED: Render Login/Register (Light Theme)
+                document.body.className = 'flex items-start justify-center min-h-screen p-4 md:p-8 bg-background';
+                container.innerHTML = renderRegisterOrLogin();
+            }
+        };
+
+        const renderRegisterOrLogin = () => {
+            const currentView = document.getElementById('login-link')?.classList.contains('active') ? 'login' : 'register';
+
+            return `
+                <div class="max-w-md w-full">
+                    <div class="text-center mb-6">
+                        <h1 class="text-3xl font-bold text-gray-900">Privacy Vault</h1>
+                        <p class="text-gray-500">Secure Identity Management Prototype</p>
+                        <p class="text-xs mt-2 p-2 bg-yellow-100 text-yellow-800 rounded">
+                           Note: Your unique ID is <span class="font-mono text-primary">${window.userId}</span>.
+                        </p>
+                    </div>
+
+                    <div id="message-box" style="display:none;" class="p-3 mb-4 rounded-lg text-sm transition duration-300"></div>
+
+                    <div class="flex justify-center mb-6 border-b border-gray-200">
+                        <button id="register-link" onclick="switchForm('register')" class="py-2 px-4 text-lg font-medium border-b-2 ${currentView === 'register' ? 'border-primary text-primary active' : 'border-transparent text-gray-500 hover:text-gray-700'}">
+                            Register
+                        </button>
+                        <button id="login-link" onclick="switchForm('login')" class="py-2 px-4 text-lg font-medium border-b-2 ${currentView === 'login' ? 'border-primary text-primary active' : 'border-transparent text-gray-500 hover:text-gray-700'}">
+                            Login
+                        </button>
+                    </div>
+
+                    <div id="form-container">
+                        ${currentView === 'register' ? renderRegisterForm() : renderLoginForm()}
+                    </div>
+                    
+                    <!-- NEW: Clear All Data Button -->
+                    <button onclick="window.handleDeleteProfile()" class="text-sm text-red-500 hover:text-red-700 mt-6 w-full p-2 rounded-lg border border-red-500/20 hover:bg-red-50/10 transition duration-150">
+                        Clear All Vault Data (Unregister)
+                    </button>
+                </div>
+            `;
+        };
+
+        window.switchForm = (type) => {
+            const formContainer = document.getElementById('form-container');
+            const registerLink = document.getElementById('register-link');
+            const loginLink = document.getElementById('login-link');
+
+            if (!formContainer || !registerLink || !loginLink) return;
+
+            if (type === 'register') {
+                formContainer.innerHTML = renderRegisterForm();
+                registerLink.classList.add('border-primary', 'text-primary', 'active');
+                registerLink.classList.remove('border-transparent', 'text-gray-500', 'hover:text-gray-700');
+                loginLink.classList.remove('border-primary', 'text-primary', 'active');
+                loginLink.classList.add('border-transparent', 'text-gray-500', 'hover:text-gray-700');
+            } else {
+                formContainer.innerHTML = renderLoginForm();
+                loginLink.classList.add('border-primary', 'text-primary', 'active');
+                loginLink.classList.remove('border-transparent', 'text-gray-500', 'hover:text-gray-700');
+                registerLink.classList.remove('border-primary', 'text-primary', 'active');
+                registerLink.classList.add('border-transparent', 'text-gray-500', 'hover:text-gray-700');
+            }
+            document.getElementById('message-box').style.display = 'none';
+        };
+
+
+        const renderRegisterForm = () => `
+            <div class="bg-white p-6 md:p-8 rounded-xl card">
+                <form onsubmit="event.preventDefault(); window.handleRegistration()">
+                    <div class="space-y-4">
+                        <h2 class="text-xl font-semibold text-gray-800">New Vault Registration</h2>
+                        <p class="text-sm text-gray-500 border-l-4 border-accent pl-3 italic">
+                           We store minimal data, encrypted on your private vault path.
+                        </p>
+                        <div>
+                            <label for="reg-email" class="block text-sm font-medium text-gray-700 mb-1">Email (Identifier)</label>
+                            <input type="email" id="reg-email" class="form-input" placeholder="user@example.com" required>
+                        </div>
+                        <div>
+                            <label for="reg-password" class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                            <input type="password" id="reg-password" class="form-input" placeholder="••••••••" required>
+                        </div>
+                        <div>
+                            <label for="reg-fullname" class="block text-sm font-medium text-gray-700 mb-1">Full Name</label>
+                            <input type="text" id="reg-fullname" class="form-input" placeholder="John Doe" required>
+                        </div>
+                        <div>
+                            <label for="reg-dob" class="block text-sm font-medium text-gray-700 mb-1">Date of Birth</label>
+                            <input type="date" id="reg-dob" class="form-input" required>
+                        </div>
+                        <div id="reg-error" class="text-red-500 text-sm"></div>
+                        <button type="submit" class="w-full bg-primary hover:bg-indigo-600 text-white font-semibold py-3 rounded-xl transition duration-300 transform hover:scale-[1.01]">
+                            Create Privacy Vault
+                        </button>
+                    </div>
+                </form>
+            </div>
+        `;
+
+        const renderLoginForm = () => `
+            <div class="bg-white p-6 md:p-8 rounded-xl card">
+                <form onsubmit="event.preventDefault(); window.handleLogin()">
+                    <div class="space-y-4">
+                        <h2 class="text-xl font-semibold text-gray-800">Vault Login</h2>
+                         <p class="text-sm text-gray-500 border-l-4 border-accent pl-3 italic">
+                           Simulated multi-factor authentication (MFA). Token is always **123456**.
+                        </p>
+                        <div>
+                            <label for="login-email" class="block text-sm font-medium text-gray-700 mb-1">Email</label>
+                            <input type="email" id="login-email" class="form-input" placeholder="user@example.com" required>
+                        </div>
+                        <div>
+                            <label for="login-password" class="block text-sm font-medium text-gray-700 mb-1">Password</label>
+                            <input type="password" id="login-password" class="form-input" placeholder="••••••••" required>
+                        </div>
+                        <div>
+                            <label for="login-token" class="block text-sm font-medium text-gray-700 mb-1">Simulated OTP/Token</label>
+                            <input type="text" id="login-token" class="form-input" value="123456" required>
+                        </div>
+                        <div id="login-error" class="text-red-500 text-sm"></div>
+                        <button type="submit" class="w-full bg-secondary hover:bg-purple-600 text-white font-semibold py-3 rounded-xl transition duration-300 transform hover:scale-[1.01]">
+                            Authenticate & Open Vault
+                        </button>
+                    </div>
+                </form>
+            </div>
+        `;
+
+        // Renders the Audit content structure
+        window.renderAuditContent = () => {
+            return `
+                <!-- Audit Form -->
+                <div id="audit-section" class="dark-card p-6 rounded-xl space-y-6">
+                    <h2 class="text-xl font-semibold border-b border-indigo-500/50 pb-2">Your Digital Habits</h2>
+                    <p class="text-sm text-gray-400">Adjust the sliders to reflect your online data sharing habits. This is a simulation based on common digital practices.</p>
+
+                    <!-- Question 1 -->
+                    <div class="space-y-2">
+                        <label for="social-login" class="block font-medium">1. How often do you use Social Media (Google, Facebook) to "Log In" to third-party apps?</label>
+                        <input type="range" id="social-login" min="0" max="4" value="2" class="range-input">
+                        <div class="flex justify-between text-xs text-gray-400">
+                            <span>Never</span>
+                            <span>Rarely</span>
+                            <span>Sometimes</span>
+                            <span>Often</span>
+                            <span>Always</span>
+                        </div>
+                    </div>
+
+                    <!-- Question 2 -->
+                    <div class="space-y-2">
+                        <label for="location-share" class="block font-medium">2. How many apps have access to your *always-on* precise location?</label>
+                        <input type="range" id="location-share" min="0" max="5" value="1" class="range-input">
+                        <div class="flex justify-between text-xs text-gray-400">
+                            <span>0 Apps</span>
+                            <span>1-2 Apps</span>
+                            <span>3-4 Apps</span>
+                            <span>5-7 Apps</span>
+                            <span>8+ Apps</span>
+                        </div>
+                    </div>
+
+                    <!-- Question 3 -->
+                    <div class="space-y-2">
+                        <label for="email-reuse" class="block font-medium">3. Do you reuse the *same* email address and password for many services?</label>
+                        <input type="range" id="email-reuse" min="0" max="2" value="1" class="range-input">
+                        <div class="flex justify-between text-xs text-gray-400">
+                            <span>No</span>
+                            <span>Sometimes</span>
+                            <span>Yes, often</span>
+                        </div>
+                    </div>
+
+                    <!-- Question 4 -->
+                    <div class="space-y-2">
+                        <label for="public-info" class="block font-medium">4. How much non-essential personal information (full birthday, phone, home city) is public on your social profiles?</label>
+                        <input type="range" id="public-info" min="0" max="3" value="1" class="range-input">
+                        <div class="flex justify-between text-xs text-gray-400">
+                            <span>None</span>
+                            <span>Minimal</span>
+                            <span>Some</span>
+                            <span>A lot</span>
+                        </div>
+                    </div>
+
+                    <button onclick="window.runAudit()" class="w-full py-3 mt-4 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-bold text-white transition duration-200">
+                        Run Data Exposure Audit
+                    </button>
+                </div>
+
+                <!-- Results Section (Hidden by default) -->
+                <div id="results-section" class="dark-card p-6 rounded-xl mt-6 hidden">
+                    <h2 class="text-2xl font-bold border-b border-indigo-500/50 pb-2 mb-4">Audit Results</h2>
+                    
+                    <div class="text-center mb-6">
+                        <p class="text-md font-medium text-gray-400">Your Calculated Data Exposure Score:</p>
+                        <p id="exposure-score" class="text-6xl font-extrabold mt-2 risk-low">0</p>
+                        <p id="risk-level" class="text-xl font-semibold mt-1 risk-low">Minimal Risk</p>
+                    </div>
+
+                    <h3 class="text-lg font-semibold mb-2">Data Minimization Recommendations:</h3>
+                    <ul id="recommendations-list" class="space-y-3 text-sm list-none pl-0">
+                        <!-- Recommendations will be injected here -->
+                    </ul>
+                    
+                    <button onclick="window.resetAudit()" class="w-full py-3 mt-6 bg-gray-600 hover:bg-gray-700 rounded-lg font-bold text-white transition duration-200">
+                        Rerun Audit
+                    </button>
+                </div>
+            `;
+        };
+
+        // Renders the wrapper for the Audit view including the Logout option
+        window.renderDashboard = () => {
+            return `
+                <div class="max-w-lg w-full">
+                    <div class="flex justify-between items-center py-6 px-2">
+                        <h1 class="text-3xl font-bold text-indigo-400">Data Exposure Audit</h1>
+                        <button onclick="window.handleLogout()" class="text-sm text-gray-400 hover:text-red-400 flex items-center p-2 rounded-full transition duration-150 bg-red-800/20 px-4">
+                            <svg class="w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+                            Logout
+                        </button>
+                    </div>
+
+                    <div id="message-box" style="display:none;" class="p-3 mb-4 rounded-lg text-sm transition duration-300"></div>
+
+                    ${window.renderAuditContent()}
+                </div>
+            `;
+        };
+
+        // Initialize Firebase on window load
+        window.onload = initializeFirebase;
+    </script>
+</head>
+<body class="flex items-start justify-center min-h-screen p-4 md:p-8 bg-background">
+    <div id="app-container" class="w-full">
+        <!-- Content will be injected here by renderApp() -->
+    </div>
+</body>
+</html>
